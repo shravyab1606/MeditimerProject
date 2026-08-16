@@ -1,0 +1,515 @@
+"""
+meditimer.py
+Single-file MediTimer desktop app:
+- Login / Signup (SQLite persistent users)
+- Medicine reminders stored in SQLite
+- Background checker triggers popup + notification + TTS + short sound
+Works on Windows; on other OSes it will still show popup + notification + TTS (if available).
+"""
+
+import os
+import sys
+import sqlite3
+import threading
+import time
+from datetime import datetime, date
+import queue
+import traceback
+import platform
+
+import tkinter as tk
+from tkinter import ttk, messagebox
+
+# Optional features
+try:
+    from plyer import notification
+    PLYER_OK = True
+except Exception:
+    PLYER_OK = False
+
+try:
+    import pyttsx3
+    TTS_OK = True
+except Exception:
+    TTS_OK = False
+
+# Windows sound fallback
+IS_WINDOWS = platform.system().lower().startswith("win")
+if IS_WINDOWS:
+    try:
+        import winsound
+        WINSOUND_OK = True
+    except Exception:
+        WINSOUND_OK = False
+else:
+    WINSOUND_OK = False
+
+DB_FILE = "meditimer.db"
+CHECK_INTERVAL_SECONDS = 20   # how often background thread checks time
+APP_TITLE = "MediTimer - Medicine Reminder"
+
+# -------------------- Database --------------------
+def ensure_db():
+    """Create DB and tables for users + reminders"""
+    conn = sqlite3.connect(DB_FILE)
+    cur = conn.cursor()
+    # users table
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT UNIQUE NOT NULL,
+            password TEXT NOT NULL
+        )
+    """)
+    # reminders table
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS reminders (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            name TEXT NOT NULL,
+            dosage TEXT,
+            time_str TEXT NOT NULL,         -- "HH:MM"
+            repeat_type TEXT NOT NULL,      -- "daily" or "once"
+            enabled INTEGER NOT NULL DEFAULT 1,
+            last_triggered_on TEXT,
+            FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+# user helpers
+def register_user(username, password):
+    conn = sqlite3.connect(DB_FILE)
+    cur = conn.cursor()
+    try:
+        cur.execute("INSERT INTO users (username, password) VALUES (?, ?)", (username.strip(), password))
+        conn.commit()
+        uid = cur.lastrowid
+    except sqlite3.IntegrityError:
+        uid = None
+    conn.close()
+    return uid
+
+def authenticate_user(username, password):
+    conn = sqlite3.connect(DB_FILE)
+    cur = conn.cursor()
+    cur.execute("SELECT id FROM users WHERE username = ? AND password = ?", (username, password))
+    row = cur.fetchone()
+    conn.close()
+    return row[0] if row else None
+
+# reminder helpers (user-scoped)
+def add_reminder(user_id, name, dosage, time_str, repeat_type="daily"):
+    conn = sqlite3.connect(DB_FILE)
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO reminders (user_id, name, dosage, time_str, repeat_type, enabled)
+        VALUES (?, ?, ?, ?, ?, 1)
+    """, (user_id, name.strip(), dosage.strip(), time_str.strip(), repeat_type))
+    conn.commit()
+    conn.close()
+
+def get_reminders(user_id):
+    conn = sqlite3.connect(DB_FILE)
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT id, name, dosage, time_str, repeat_type, enabled, last_triggered_on
+        FROM reminders
+        WHERE user_id = ?
+        ORDER BY time_str ASC, id ASC
+    """, (user_id,))
+    rows = cur.fetchall()
+    conn.close()
+    return rows
+
+def delete_reminder(reminder_id):
+    conn = sqlite3.connect(DB_FILE)
+    cur = conn.cursor()
+    cur.execute("DELETE FROM reminders WHERE id = ?", (reminder_id,))
+    conn.commit()
+    conn.close()
+
+def toggle_enabled(reminder_id, new_enabled):
+    conn = sqlite3.connect(DB_FILE)
+    cur = conn.cursor()
+    cur.execute("UPDATE reminders SET enabled = ? WHERE id = ?", (1 if new_enabled else 0, reminder_id))
+    conn.commit()
+    conn.close()
+
+def mark_triggered_today(reminder_id):
+    today = date.today().isoformat()
+    conn = sqlite3.connect(DB_FILE)
+    cur = conn.cursor()
+    cur.execute("UPDATE reminders SET last_triggered_on = ? WHERE id = ?", (today, reminder_id))
+    conn.commit()
+    conn.close()
+
+# -------------------- Notifications / Sound / TTS --------------------
+def system_notify(title, message):
+    try:
+        if PLYER_OK:
+            notification.notify(title=title, message=message, timeout=8)
+    except Exception:
+        pass
+
+def speak_text(text):
+    if not TTS_OK:
+        return
+    try:
+        engine = pyttsx3.init()
+        rate = engine.getProperty('rate')
+        engine.setProperty('rate', int(rate * 0.95))
+        engine.say(text)
+        engine.runAndWait()
+    except Exception:
+        pass
+
+def play_sound_short():
+    """Play a short alert sound. Windows: winsound.MessageBeep; else try a simple beep via stdout."""
+    try:
+        if WINSOUND_OK:
+            # try a system beep variant (MB_ICONEXCLAMATION) or a quick Beep
+            try:
+                winsound.MessageBeep(winsound.MB_ICONEXCLAMATION)
+            except Exception:
+                # fallback to frequency beep
+                winsound.Beep(800, 350)
+        else:
+            # cross-platform fallback: print BEL to terminal (may beep on some terminals)
+            sys.stdout.write('\a')
+            sys.stdout.flush()
+    except Exception:
+        pass
+
+# -------------------- Reminder App UI --------------------
+class ReminderApp:
+    def __init__(self, root, user_id, username):
+        self.root = root
+        self.user_id = user_id
+        self.username = username
+        self.root.title(f"{APP_TITLE} — {username}")
+        self.root.geometry("760x520")
+        self.root.minsize(700, 460)
+
+        self.ui_queue = queue.Queue()
+        self._stop_event = threading.Event()
+
+        self.build_ui()
+        self.refresh_table()
+
+        # start checker thread
+        self.checker_thread = threading.Thread(target=self.background_checker, daemon=True)
+        self.checker_thread.start()
+        # schedule queue processing
+        self.root.after(200, self.process_ui_queue)
+
+    def build_ui(self):
+        pad = 8
+        frm_top = ttk.Frame(self.root, padding=pad)
+        frm_top.pack(fill="x")
+
+        ttk.Label(frm_top, text="Medicine Name").grid(row=0, column=0, sticky="w")
+        self.name_var = tk.StringVar()
+        ttk.Entry(frm_top, textvariable=self.name_var, width=30).grid(row=1, column=0, padx=(0, pad))
+
+        ttk.Label(frm_top, text="Dosage / Notes").grid(row=0, column=1, sticky="w")
+        self.dose_var = tk.StringVar()
+        ttk.Entry(frm_top, textvariable=self.dose_var, width=30).grid(row=1, column=1, padx=(0, pad))
+
+        ttk.Label(frm_top, text="Time (24h HH:MM)").grid(row=0, column=2, sticky="w")
+        self.time_var = tk.StringVar()
+        ttk.Entry(frm_top, textvariable=self.time_var, width=12).grid(row=1, column=2, padx=(0, pad))
+
+        self.repeat_var = tk.StringVar(value="daily")
+        ttk.Label(frm_top, text="Repeat").grid(row=0, column=3, sticky="w")
+        repeat_box = ttk.Combobox(frm_top, textvariable=self.repeat_var, values=["daily", "once"], width=10, state="readonly")
+        repeat_box.grid(row=1, column=3)
+
+        ttk.Button(frm_top, text="Add Reminder", command=self.handle_add).grid(row=1, column=4, padx=(pad, 0))
+
+        # Table
+        table_frame = ttk.Frame(self.root, padding=(pad,0,pad,pad))
+        table_frame.pack(fill="both", expand=True)
+
+        cols = ("id","name","dosage","time","repeat","enabled")
+        self.tree = ttk.Treeview(table_frame, columns=cols, show="headings", height=12)
+        for c,w in zip(cols,(60,220,200,100,80,80)):
+            self.tree.heading(c, text=c.capitalize())
+            self.tree.column(c, width=w, anchor="center")
+        self.tree.pack(side="left", fill="both", expand=True)
+
+        scroll = ttk.Scrollbar(table_frame, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=scroll.set)
+        scroll.pack(side="right", fill="y")
+
+        # Buttons
+        btns = ttk.Frame(self.root, padding=(pad,0,pad,pad))
+        btns.pack(fill="x")
+
+        ttk.Button(btns, text="Enable / Disable", command=self.handle_toggle).pack(side="left")
+        ttk.Button(btns, text="Delete", command=self.handle_delete).pack(side="left", padx=(pad,0))
+        ttk.Button(btns, text="Refresh", command=self.refresh_table).pack(side="left", padx=(pad,0))
+        ttk.Button(btns, text="Logout", command=self.handle_logout).pack(side="right")
+
+        ttk.Label(btns, text="Tip: keep this app running to receive reminders.", foreground="grey").pack(side="right", padx=(0,10))
+
+    def handle_add(self):
+        name = self.name_var.get().strip()
+        dosage = self.dose_var.get().strip()
+        time_str = self.time_var.get().strip()
+        repeat_type = self.repeat_var.get()
+        if not name:
+            messagebox.showwarning(APP_TITLE, "Please enter a medicine name.")
+            return
+        if not self.valid_time(time_str):
+            messagebox.showwarning(APP_TITLE, "Time must be HH:MM (24h).")
+            return
+        try:
+            add_reminder(self.user_id, name, dosage, time_str, repeat_type)
+            self.name_var.set("")
+            self.dose_var.set("")
+            self.time_var.set("")
+            self.repeat_var.set("daily")
+            self.refresh_table()
+        except Exception as e:
+            messagebox.showerror(APP_TITLE, f"Failed to add reminder:\n{e}")
+
+    def handle_delete(self):
+        item = self.get_selected_item_id()
+        if not item:
+            messagebox.showinfo(APP_TITLE, "Select a reminder to delete.")
+            return
+        if messagebox.askyesno(APP_TITLE, "Delete selected reminder?"):
+            delete_reminder(item)
+            self.refresh_table()
+
+    def handle_toggle(self):
+        item = self.get_selected_item_id()
+        if not item:
+            messagebox.showinfo(APP_TITLE, "Select a reminder.")
+            return
+        for row in self.tree.get_children():
+            vals = self.tree.item(row,"values")
+            if int(vals[0]) == item:
+                enabled = (vals[5] == "Yes")
+                toggle_enabled(item, not enabled)
+                self.refresh_table()
+                break
+
+    def get_selected_item_id(self):
+        sel = self.tree.selection()
+        if not sel: return None
+        vals = self.tree.item(sel[0],"values")
+        return int(vals[0])
+
+    def refresh_table(self):
+        for r in self.tree.get_children():
+            self.tree.delete(r)
+        for rid, name, dosage, time_str, repeat_type, enabled, last_trig in get_reminders(self.user_id):
+            self.tree.insert("", "end", values=(rid, name, dosage, time_str, repeat_type, "Yes" if enabled else "No"))
+
+    @staticmethod
+    def valid_time(t):
+        try:
+            datetime.strptime(t, "%H:%M")
+            return True
+        except Exception:
+            return False
+
+    def background_checker(self):
+        """Daemon thread: check reminders and enqueue UI triggers"""
+        while not self._stop_event.is_set():
+            try:
+                now = datetime.now()
+                now_hhmm = now.strftime("%H:%M")
+                today_str = date.today().isoformat()
+                rows = get_reminders(self.user_id)
+                for rid, name, dosage, time_str, repeat_type, enabled, last_trig in rows:
+                    if not enabled: continue
+                    if time_str != now_hhmm: continue
+                    if last_trig == today_str: continue
+                    # enqueue trigger
+                    self.ui_queue.put(("trigger", {"id": rid, "name": name, "dosage": dosage, "time_str": time_str, "repeat_type": repeat_type}))
+                # sleep in small increments for responsive shutdown
+                for _ in range(int(CHECK_INTERVAL_SECONDS * 10)):
+                    if self._stop_event.is_set(): break
+                    time.sleep(0.1)
+            except Exception:
+                traceback.print_exc(file=sys.stderr)
+                time.sleep(2)
+
+    def process_ui_queue(self):
+        try:
+            while True:
+                action, payload = self.ui_queue.get_nowait()
+                if action == "trigger":
+                    self.trigger_alarm(payload)
+                self.ui_queue.task_done()
+        except queue.Empty:
+            pass
+        self.root.after(200, self.process_ui_queue)
+
+    def trigger_alarm(self, payload):
+        rid = payload["id"]
+        name = payload["name"]
+        dosage = payload["dosage"]
+        time_str = payload["time_str"]
+        repeat_type = payload["repeat_type"]
+
+        # mark triggered BEFORE speaking/playing to prevent double fire
+        mark_triggered_today(rid)
+
+        # system notification
+        title = "MediTimer Reminder"
+        body = f"{name}" + (f" — {dosage}" if dosage else "") + f"\nTime: {time_str}"
+        system_notify(title, body)
+
+        # popup on main thread
+        self.show_popup(name, dosage, time_str)
+
+        # play sound & speak
+        threading.Thread(target=play_sound_short, daemon=True).start()
+        text_lines = [f"Please take {name}."]
+        if dosage:
+            text_lines.append(f"Dosage: {dosage}.")
+        speak_msg = " ".join(text_lines)
+        if TTS_OK:
+            threading.Thread(target=lambda: speak_text(speak_msg), daemon=True).start()
+
+        # if once -> disable
+        if repeat_type == "once":
+            toggle_enabled(rid, False)
+            self.refresh_table()
+
+    def show_popup(self, name, dosage, time_str):
+        top = tk.Toplevel(self.root)
+        top.title("Reminder")
+        top.grab_set()
+        try:
+            top.attributes("-topmost", True)
+        except Exception:
+            pass
+        top.geometry("360x200")
+        frm = ttk.Frame(top, padding=12)
+        frm.pack(fill="both", expand=True)
+        ttk.Label(frm, text="⏰ Medicine Reminder", font=("TkDefaultFont", 12, "bold")).pack(anchor="w", pady=(0,8))
+        ttk.Label(frm, text=f"Medicine: {name}", font=("TkDefaultFont", 11)).pack(anchor="w", pady=2)
+        if dosage:
+            ttk.Label(frm, text=f"Dosage: {dosage}", font=("TkDefaultFont", 11)).pack(anchor="w", pady=2)
+        ttk.Label(frm, text=f"Time: {time_str}", font=("TkDefaultFont", 11)).pack(anchor="w", pady=2)
+
+        btns = ttk.Frame(frm)
+        btns.pack(side="bottom", fill="x", pady=(12,0))
+        ttk.Button(btns, text="OK", command=top.destroy).pack(side="right", padx=6)
+
+    def handle_logout(self):
+        if messagebox.askyesno(APP_TITLE, "Logout and return to login?"):
+            self._stop_event.set()
+            # close window and restart login
+            try:
+                self.root.destroy()
+            except Exception:
+                pass
+            # create fresh login root
+            new_root = tk.Tk()
+            app = LoginApp(new_root)
+            new_root.mainloop()
+
+    def on_close(self):
+        self._stop_event.set()
+        try:
+            self.root.destroy()
+        except Exception:
+            pass
+
+# -------------------- Login / Signup UI --------------------
+class LoginApp:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("MediTimer - Login")
+        self.root.geometry("420x320")
+        self.build_ui()
+
+    def build_ui(self):
+        self.clear_window()
+        pad = 12
+        ttk.Label(self.root, text="MediTimer", font=("Arial", 20, "bold")).pack(pady=(18,6))
+        ttk.Button(self.root, text="Login", width=20, command=self.show_login).pack(pady=8)
+        ttk.Button(self.root, text="Signup", width=20, command=self.show_signup).pack(pady=8)
+        ttk.Button(self.root, text="Quit", width=10, command=self.root.quit).pack(side="bottom", pady=10)
+
+    def clear_window(self):
+        for w in self.root.winfo_children():
+            w.destroy()
+
+    def show_login(self):
+        self.clear_window()
+        ttk.Label(self.root, text="Login", font=("Arial", 16, "bold")).pack(pady=(12,6))
+        frame = ttk.Frame(self.root, padding=8)
+        frame.pack()
+        ttk.Label(frame, text="Username:").grid(row=0, column=0, sticky="w")
+        username_e = ttk.Entry(frame, width=30); username_e.grid(row=1, column=0, pady=(0,8))
+        ttk.Label(frame, text="Password:").grid(row=2, column=0, sticky="w")
+        password_e = ttk.Entry(frame, show="*", width=30); password_e.grid(row=3, column=0, pady=(0,8))
+
+        def do_login():
+            u = username_e.get().strip()
+            p = password_e.get()
+            if not u or not p:
+                messagebox.showwarning("Login", "Enter username & password")
+                return
+            uid = authenticate_user(u, p)
+            if uid:
+                messagebox.showinfo("Login", "Login successful")
+                # open reminder app
+                try:
+                    self.root.destroy()
+                except Exception:
+                    pass
+                new_root = tk.Tk()
+                ensure_db()
+                reminder = ReminderApp(new_root, uid, u)
+                new_root.protocol("WM_DELETE_WINDOW", reminder.on_close)
+                new_root.mainloop()
+            else:
+                messagebox.showerror("Login", "Invalid credentials")
+
+        ttk.Button(self.root, text="Login", command=do_login).pack(pady=6)
+        ttk.Button(self.root, text="Back", command=self.build_ui).pack()
+
+    def show_signup(self):
+        self.clear_window()
+        ttk.Label(self.root, text="Signup", font=("Arial", 16, "bold")).pack(pady=(12,6))
+        frame = ttk.Frame(self.root, padding=8)
+        frame.pack()
+        ttk.Label(frame, text="Username:").grid(row=0, column=0, sticky="w")
+        username_e = ttk.Entry(frame, width=30); username_e.grid(row=1, column=0, pady=(0,8))
+        ttk.Label(frame, text="Password:").grid(row=2, column=0, sticky="w")
+        password_e = ttk.Entry(frame, show="*", width=30); password_e.grid(row=3, column=0, pady=(0,8))
+
+        def do_signup():
+            u = username_e.get().strip()
+            p = password_e.get()
+            if not u or not p:
+                messagebox.showwarning("Signup", "All fields required")
+                return
+            uid = register_user(u, p)
+            if uid:
+                messagebox.showinfo("Signup", "Account created — you can now login")
+                self.show_login()
+            else:
+                messagebox.showerror("Signup", "Username already exists")
+
+        ttk.Button(self.root, text="Signup", command=do_signup).pack(pady=6)
+        ttk.Button(self.root, text="Back", command=self.build_ui).pack()
+
+# -------------------- Main --------------------
+def main():
+    ensure_db()
+    root = tk.Tk()
+    app = LoginApp(root)
+    root.mainloop()
+
+if __name__ == "__main__":
+    main()
